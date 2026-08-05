@@ -1,0 +1,12 @@
+name: Schedule Test
+on:
+  schedule:
+    - cron: '30 23 * * *'
+permissions:
+  contents: write
+  workflows: write
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "schedule with workflows permission works"
