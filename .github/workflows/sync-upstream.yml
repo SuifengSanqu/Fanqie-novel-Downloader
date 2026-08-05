@@ -16,6 +16,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Configure git
         run: |
@@ -24,7 +25,7 @@ jobs:
 
       - name: Add upstream and sync
         env:
-          GH_TOKEN: ${{ github.token }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           git remote add upstream https://github.com/POf-L/Fanqie-novel-Downloader.git
           git fetch --depth=1 upstream main
@@ -35,4 +36,4 @@ jobs:
           fi
 
           git merge upstream/main --no-edit -X theirs --allow-unrelated-histories
-          git push origin main
+          git push "https://x-access-token:${SYNC_TOKEN}@github.com/SuifengSanqu/Fanqie-novel-Downloader.git" main
