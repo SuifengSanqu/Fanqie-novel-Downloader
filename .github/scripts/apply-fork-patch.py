@@ -11,3 +11,10 @@ new = (
 )
 if old in text and new not in text:
     p.write_text(text.replace(old, new))
+
+ci = Path(".github/workflows/ci.yml")
+text = ci.read_text()
+old = "args: -no-color"
+new = "args: -no-color -ignore 'SC2016:'"
+if old in text and new not in text:
+    ci.write_text(text.replace(old, new))
