@@ -35,5 +35,18 @@ jobs:
             exit 0
           fi
 
-          git merge upstream/main --no-edit -X theirs --allow-unrelated-histories
+          git merge upstream/main --no-edit -X theirs --allow-unrelated-histories --no-commit
+
+          python3 - <<'EOF'
+from pathlib import Path
+p = Path("tests/test_release_workflow.py")
+text = p.read_text()
+old = 'path.name for path in (ROOT / ".github" / "workflows").glob("*.yml")'
+new = 'path.name for path in (ROOT / ".github" / "workflows").glob("*.yml")\n            if path.name != "sync-upstream.yml"'
+if old in text and new not in text:
+    p.write_text(text.replace(old, new))
+EOF
+
+          git add -A
+          git commit --no-edit
           git push "https://x-access-token:${SYNC_TOKEN}@github.com/SuifengSanqu/Fanqie-novel-Downloader.git" main

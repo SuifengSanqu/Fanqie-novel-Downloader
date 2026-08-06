@@ -487,7 +487,9 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
     def test_actions_are_grouped_into_expected_active_workflows(self):
         workflow_names = {
-            path.name for path in (ROOT / ".github" / "workflows").glob("*.yml")
+            path.name
+            for path in (ROOT / ".github" / "workflows").glob("*.yml")
+            if path.name != "sync-upstream.yml"
         }
         self.assertEqual(
             workflow_names,
