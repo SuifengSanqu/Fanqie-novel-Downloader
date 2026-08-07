@@ -411,7 +411,7 @@ def write_manifest(assets: list[dict], path: Path) -> None:
             fail(f"invalid digest for {asset.get('name')}")
         lines.append(f"{match.group(1)}  {asset['name']}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
 def verify_manifest_asset(release: dict, path: Path) -> None:
@@ -425,6 +425,31 @@ def verify_manifest_asset(release: dict, path: Path) -> None:
         fail("published release does not contain exactly one unsigned manifest")
     if matches[0].get("digest") != expected:
         fail("published unsigned manifest digest does not match local content")
+
+
+def existing_manifest_is_current(release: dict, assets: list[dict]) -> bool:
+    """Check whether a prior finalizer run already uploaded this manifest."""
+
+    manifest_asset = next(
+        (
+            asset
+            for asset in release.get("assets", [])
+            if isinstance(asset, dict)
+            and str(asset.get("name") or "").lower() == MANIFEST_NAME.lower()
+        ),
+        None,
+    )
+    if manifest_asset is None:
+        return False
+    expected_lines = []
+    for asset in sorted(assets, key=lambda item: str(item["name"])):
+        match = DIGEST_RE.fullmatch(str(asset.get("digest") or ""))
+        if match is None:
+            fail(f"invalid digest for {asset.get('name')}")
+        expected_lines.append(f"{match.group(1)}  {asset['name']}")
+    expected = ("\n".join(expected_lines) + "\n").encode("utf-8")
+    actual_digest = str(manifest_asset.get("digest") or "")
+    return actual_digest == "sha256:" + hashlib.sha256(expected).hexdigest()
 
 
 def normalize_unsigned_updater_metadata(
@@ -477,6 +502,89 @@ def normalize_unsigned_updater_metadata(
         ]
     )
     return True
+
+
+def verify_device_guide(
+    notes: str,
+    *,
+    platforms: str,
+    updater_available: bool,
+    mode: str = "formal",
+) -> None:
+    """Make the user-facing device guide a publication invariant."""
+
+    required = [
+        FINALIZER_START,
+        FINALIZER_END,
+        "## 平台状态与安装限制",
+        "## 下载地址",
+        "### 🪟 Windows",
+        "### 🍎 macOS",
+        "### 🐧 Linux",
+        "### 🤖 Android",
+        "### 📱 iOS",
+        "SHA-256 完整清单",
+    ]
+    selected = selected_platforms(platforms)
+    platform_requirements = {
+        "windows-x64": (
+            "64位（常用）",
+            "便携版（无需安装）",
+            "windows-x64-portable.exe",
+        ),
+        "windows-arm64": (
+            "ARM64（Surface / 骁龙本）",
+            "便携版（无需安装）",
+            "windows-arm64-portable.exe",
+        ),
+        "linux-x64": (
+            "DEB 包（推荐，体积小，Debian / Ubuntu 等）",
+            "AppImage（免安装）",
+            "linux-amd64.deb",
+            "linux-amd64.AppImage",
+        ),
+        "linux-arm64": (
+            "DEB 包（推荐，体积小，Debian / Ubuntu 等）",
+            "AppImage（免安装）",
+            "linux-arm64.deb",
+            "linux-arm64.AppImage",
+        ),
+        "macos-x64": (
+            "Intel 芯片",
+            "APP 压缩包",
+            "darwin-x64.dmg",
+            "darwin-x64.zip",
+        ),
+        "macos-arm64": (
+            "Apple M 芯片",
+            "APP 压缩包",
+            "darwin-aarch64.dmg",
+            "darwin-aarch64.zip",
+        ),
+        "android": (
+            "64位 arm64-v8a",
+            "32位 armeabi-v7a",
+            "通用版 universal",
+            "x86_64（模拟器 / 部分平板）",
+            "AAB（上架用）",
+        ),
+        "ios": ("无签名 IPA（需自行侧载）",),
+    }
+    for platform in sorted(selected):
+        requirements = platform_requirements.get(platform)
+        if requirements is None:
+            fail(f"unsupported platform in unsigned device guide: {platform}")
+        required.extend(requirements)
+    missing = [value for value in required if value not in notes]
+    if updater_available:
+        required_channel_values = ("Minisign",)
+        if mode != "prerelease":
+            required_channel_values += ("unsigned/latest.json",)
+        for value in required_channel_values:
+            if value not in notes:
+                missing.append(value)
+    if missing:
+        fail("unsigned release device guide is incomplete: " + ", ".join(missing))
 
 
 def normalized_highlights(path: Path | None) -> list[str]:
@@ -577,15 +685,22 @@ def generate_finalizer_appendix(
     device_guide = rendered[guide_start:guide_end].rstrip()
     updater_available = has_updater_metadata(release)
     update_line = (
-        f"- 无签名自动更新元数据：[latest.json]({public_url(repo, tag, 'latest.json')})；"
-        "客户端通过固定 `unsigned/latest.json` 别名读取，并使用项目 updater 公钥验签。"
-        if updater_available
-        else "- 这个历史版本没有 updater 元数据，只能手动覆盖安装；后续无签名构建会使用独立的 `unsigned` 更新通道。"
+        (
+            f"- 无签名自动更新元数据：[latest.json]({public_url(repo, tag, 'latest.json')})；"
+            "客户端通过固定 `unsigned/latest.json` 别名读取，并使用项目 updater 公钥验签。"
+        )
+        if updater_available and mode != "prerelease"
+        else (
+            f"- 测试预发布 updater 元数据：[latest.json]({public_url(repo, tag, 'latest.json')})；"
+            "该版本不进入固定 `unsigned` 别名，只有显式安装测试通道的客户端会读取并验签。"
+            if updater_available
+            else "- 这个历史版本没有 updater 元数据，只能手动覆盖安装。"
+        )
     )
     installer_count = len(
         validate_assets(release, platforms, allow_updater=updater_available)[1]
     )
-    return "\n".join(
+    appendix = "\n".join(
         [
             FINALIZER_START,
             "---",
@@ -616,19 +731,34 @@ def generate_finalizer_appendix(
             FINALIZER_END,
         ]
     )
+    verify_device_guide(
+        appendix,
+        platforms=platforms,
+        updater_available=updater_available,
+        mode=mode,
+    )
+    return appendix
 
 
 def append_finalizer(body: str, appendix: str) -> str:
     """Append the unsigned managed block without replacing the Draft body."""
-    body = body.rstrip()
-    start = body.find(FINALIZER_START)
-    end = body.find(FINALIZER_END, start + len(FINALIZER_START)) if start >= 0 else -1
-    if start >= 0:
-        if end < 0:
+    starts = body.count(FINALIZER_START)
+    ends = body.count(FINALIZER_END)
+    if starts != ends or starts > 1:
+        fail("release body contains invalid unsigned finalizer markers")
+    if starts == 1:
+        start = body.find(FINALIZER_START)
+        end = body.find(FINALIZER_END, start + len(FINALIZER_START))
+        if end < start:
             fail("release body contains an incomplete unsigned finalizer block")
         end += len(FINALIZER_END)
-        body = (body[:start].rstrip() + "\n\n" + body[end:].lstrip()).rstrip()
-    return f"{body}\n\n{appendix.rstrip()}\n" if body else f"{appendix.rstrip()}\n"
+        return body[:start] + appendix.rstrip() + body[end:]
+    if not body:
+        return f"{appendix.rstrip()}\n"
+    separator = (
+        "" if body.endswith("\n\n") else ("\n" if body.endswith("\n") else "\n\n")
+    )
+    return f"{body}{separator}{appendix.rstrip()}\n"
 
 
 def verify_published_urls(release: dict, repo: str, tag: str) -> None:
@@ -756,11 +886,35 @@ def main() -> int:
     release = fetch_release(repo, database_id, release_path)
     if release.get("tag_name") != tag:
         fail(f"unexpected release tag: {release.get('tag_name')!r}")
-    if release.get("draft") is not True:
-        fail("unsigned assets must be finalized while the release is a draft")
+    resume_published = release.get("draft") is False
+    if release.get("draft") not in (True, False):
+        fail("unsigned release has an invalid draft state")
     expected_prerelease = args.mode == "prerelease"
     if bool(release.get("prerelease")) != expected_prerelease:
         fail("unsigned release prerelease state does not match finalizer mode")
+    already_finalized = False
+    if resume_published:
+        body = str(release.get("body") or "")
+        asset_names = {
+            str(asset.get("name") or "")
+            for asset in release.get("assets", [])
+            if isinstance(asset, dict)
+        }
+        already_finalized = FINALIZER_START in body or MANIFEST_NAME in asset_names
+        if already_finalized:
+            if body.count(FINALIZER_START) != 1 or body.count(FINALIZER_END) != 1:
+                fail("published unsigned release has invalid finalizer markers")
+            if MANIFEST_NAME not in asset_names:
+                fail("published unsigned release has no finalizer manifest")
+            print(
+                "Resuming unsigned channel publication after finalizer completion",
+                flush=True,
+            )
+        else:
+            print(
+                "Resuming an unsigned release published before finalizer completion",
+                flush=True,
+            )
 
     stable_before = stable_source_tag(repo)
     if not stable_before:
@@ -797,6 +951,54 @@ def main() -> int:
     assets, installers = validate_assets(
         release, platforms, allow_updater=updater_available
     )
+    if already_finalized:
+        if not existing_manifest_is_current(release, assets):
+            fail("published unsigned manifest no longer matches release assets")
+        verify_device_guide(
+            str(release.get("body") or ""),
+            platforms=platforms,
+            updater_available=updater_available,
+            mode=args.mode,
+        )
+        observed_latest = wait_for_latest_tag(repo, tag) if args.mode == "formal" else ""
+        if updater_available and args.mode == "formal":
+            unsigned_publisher = Path(__file__).with_name(
+                "publish-unsigned-channel.py"
+            )
+            unsigned_dir = Path(
+                os.environ.get("RUNNER_TEMP", str(work_dir.parent))
+            ) / "unsigned-channel-check"
+            run(
+                [
+                    sys.executable,
+                    str(unsigned_publisher),
+                    "--repo",
+                    repo,
+                    "--source-tag",
+                    tag,
+                    "--work-dir",
+                    str(unsigned_dir),
+                ]
+            )
+        stable_after = stable_source_tag(repo)
+        if stable_after != stable_before:
+            fail(
+                "stable channel changed while resuming unsigned release: "
+                f"{stable_before!r} -> {stable_after!r}"
+            )
+        append_summary(
+            repo=repo,
+            tag=tag,
+            release=release,
+            source_commit=source_commit,
+            stable_tag=stable_after,
+        )
+        print(
+            f"Unsigned release finalizer resumed: "
+            f"https://github.com/{repo}/releases/tag/{tag}",
+            flush=True,
+        )
+        return 0
     write_manifest(assets, manifest_path)
     appendix = generate_finalizer_appendix(
         release=release,
@@ -810,6 +1012,12 @@ def main() -> int:
         highlights=normalized_highlights(args.highlights_file),
     )
     notes = append_finalizer(str(release.get("body") or ""), appendix)
+    verify_device_guide(
+        notes,
+        platforms=platforms,
+        updater_available=updater_available,
+        mode=args.mode,
+    )
 
     run(
         [
@@ -849,6 +1057,12 @@ def main() -> int:
     verify_published_urls(published, repo, tag)
     if source_commit not in str(published.get("body") or ""):
         fail("published release notes do not contain the source commit")
+    verify_device_guide(
+        str(published.get("body") or ""),
+        platforms=platforms,
+        updater_available=updater_available,
+        mode=args.mode,
+    )
     observed_latest = wait_for_latest_tag(repo, tag) if args.mode == "formal" else ""
     if updater_available and args.mode == "formal":
         unsigned_publisher = Path(__file__).with_name("publish-unsigned-channel.py")
