@@ -170,9 +170,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         )
         self.assertEqual(
             self.workflow.count(
-                'test ! -d "${app_path}/Contents/_CodeSignature"'
+                'codesign -dvv "${app_path}" 2>&1 | grep -Fqx "Signature=adhoc"'
             ),
             2,
+        )
+        self.assertNotIn(
+            'test ! -d "${app_path}/Contents/_CodeSignature"', self.workflow
         )
 
     def test_unsigned_prerelease_uploads_release_assets_for_every_platform(self):
@@ -377,7 +380,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
             "macos-latest",
             "x86_64-apple-darwin",
             "aarch64-apple-darwin",
-            'test ! -d "${app_path}/Contents/_CodeSignature"',
+            'test -d "${app_path}/Contents/_CodeSignature"',
+            'codesign -dvv "${app_path}" 2>&1 | grep -Fqx "Signature=adhoc"',
             'test "${bundle_id}" = "com.pofl.fanqienoveldownloader"',
             'test "${bundle_version}" = "${APP_VERSION}"',
             'file "${executable}" | grep -F "${MACHO_ARCH}"',
