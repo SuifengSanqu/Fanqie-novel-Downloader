@@ -140,8 +140,17 @@ App Store 或 TestFlight 正式发布。
 
 **macOS 提示应用已损坏**
 
-这通常是未签名、未公证应用被 Gatekeeper 拦截，不表示下载文件一定损坏。请确认架构、
-核对校验和，并按对应 Release 的安装说明处理。
+这不表示下载文件损坏，而是 Gatekeeper 对带隔离属性且缺少 Apple 公证的应用给出的提示。
+请先确认架构并核对校验和，然后前往“系统设置 → 隐私与安全性”选择“仍要打开”。
+
+`2026.8.18` 及更早的 macOS 包完全没有代码签名封印，系统不会给出“仍要打开”入口，
+只能在核对 SHA-256 后对该应用单独移除隔离属性：
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Fanqie Novel Downloader.app"
+```
+
+之后的构建带 ad-hoc 签名，可直接用“仍要打开”放行。不需要、也不应全局关闭 Gatekeeper。
 
 **Linux 无法启动**
 

@@ -892,8 +892,12 @@ jobs:
                   os.environ["CREATE_UPDATER_ARTIFACTS"] == "true"
           }
           identity = os.environ.get("APPLE_SIGNING_IDENTITY", "").strip()
-          if identity:
-              bundle["macOS"] = {"signingIdentity": identity}
+          # 没有 Developer ID 时退回 ad-hoc 签名（"-"）。完全没有 bundle 签名封印的
+          # .app 带着 com.apple.quarantine 打开会被 Gatekeeper 判为“已损坏，无法打开”，
+          # 且系统不提供“仍要打开”入口。ad-hoc 签名可让其降级为可绕过的开发者验证提示。
+          if not identity:
+              identity = "-"
+          bundle["macOS"] = {"signingIdentity": identity}
           endpoint = (
               "https://github.com/POf-L/Fanqie-novel-Downloader/releases/download/"
               f"{os.environ['UPDATE_CHANNEL']}/latest.json"
@@ -1023,7 +1027,9 @@ jobs:
           dmg_path="$(find "${bundle_root}/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
           test -n "${app_path}"
           test -n "${dmg_path}"
-          test ! -d "${app_path}/Contents/_CodeSignature"
+          test -d "${app_path}/Contents/_CodeSignature"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          codesign -dvv "${app_path}" 2>&1 | grep -Fqx "Signature=adhoc"
           hdiutil verify "${dmg_path}"
 
       - name: Upload unsigned desktop installers
@@ -1325,8 +1331,12 @@ jobs:
                   os.environ["CREATE_UPDATER_ARTIFACTS"] == "true"
           }
           identity = os.environ.get("APPLE_SIGNING_IDENTITY", "").strip()
-          if identity:
-              bundle["macOS"] = {"signingIdentity": identity}
+          # 没有 Developer ID 时退回 ad-hoc 签名（"-"）。完全没有 bundle 签名封印的
+          # .app 带着 com.apple.quarantine 打开会被 Gatekeeper 判为“已损坏，无法打开”，
+          # 且系统不提供“仍要打开”入口。ad-hoc 签名可让其降级为可绕过的开发者验证提示。
+          if not identity:
+              identity = "-"
+          bundle["macOS"] = {"signingIdentity": identity}
           endpoint = (
               "https://github.com/POf-L/Fanqie-novel-Downloader/releases/download/"
               f"{os.environ['UPDATE_CHANNEL']}/latest.json"
@@ -1457,7 +1467,9 @@ jobs:
           dmg_path="$(find "${bundle_root}/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
           test -n "${app_path}"
           test -n "${dmg_path}"
-          test ! -d "${app_path}/Contents/_CodeSignature"
+          test -d "${app_path}/Contents/_CodeSignature"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          codesign -dvv "${app_path}" 2>&1 | grep -Fqx "Signature=adhoc"
           hdiutil verify "${dmg_path}"
 
       - name: Upload unsigned desktop installers
