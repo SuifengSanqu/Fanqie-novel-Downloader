@@ -106,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           drafts=$(gh release list --repo "${GH_REPO}" --limit 200 --json tagName,isDraft \
-            --jq '.[] | select(.draft) | .tagName')
+            --jq '.[] | select(.isDraft) | .tagName')
           if [[ -z "$(printf '%s' "${drafts}" | tr -d '[:space:]')" ]]; then
             echo "没有需要清理的 draft release"
             exit 0
@@ -1007,8 +1007,8 @@ jobs:
             if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -or [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
               throw '缺少便携版 updater 签名密钥'
             }
-            cargo install tauri-cli --version $env:TAURI_CLI_VERSION --locked
-            cargo tauri signer sign $portable
+            npm install --global "@tauri-apps/cli@$env:TAURI_CLI_VERSION"
+            tauri signer sign $portable
             $signature = "$portable.sig"
             if (-not (Test-Path -LiteralPath $signature -PathType Leaf) -or (Get-Item -LiteralPath $signature).Length -le 0) {
               throw "便携版签名生成失败: $signature"
@@ -1447,8 +1447,8 @@ jobs:
             if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -or [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
               throw '缺少便携版 updater 签名密钥'
             }
-            cargo install tauri-cli --version $env:TAURI_CLI_VERSION --locked
-            cargo tauri signer sign $portable
+            npm install --global "@tauri-apps/cli@$env:TAURI_CLI_VERSION"
+            tauri signer sign $portable
             $signature = "$portable.sig"
             if (-not (Test-Path -LiteralPath $signature -PathType Leaf) -or (Get-Item -LiteralPath $signature).Length -le 0) {
               throw "便携版签名生成失败: $signature"
