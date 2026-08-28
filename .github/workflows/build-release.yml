@@ -106,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           drafts=$(gh release list --repo "${GH_REPO}" --limit 200 --json tagName,isDraft \
-            --jq '.[] | select(.draft) | .tagName')
+            --jq '.[] | select(.isDraft) | .tagName')
           if [[ -z "$(printf '%s' "${drafts}" | tr -d '[:space:]')" ]]; then
             echo "没有需要清理的 draft release"
             exit 0
