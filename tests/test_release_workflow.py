@@ -155,7 +155,17 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.workflow.count("tauri signer sign $portable"),
             2,
         )
-        self.assertNotIn("cargo install tauri-cli", self.workflow)
+        self.assertNotIn("cargo install tauri-cli --version $env:", self.workflow)
+        # 移动端不能改用 npm 的 tauri：Gradle 的 rustBuild* 任务和 Xcode 的
+        # "Build Rust Code" script phase 调用的是 cargo 子命令 `cargo tauri`，
+        # 而 npm 全局安装不会提供 ~/.cargo/bin/cargo-tauri，会报
+        # "no such command: tauri"。所以 Android / iOS 保留 cargo install。
+        self.assertEqual(
+            self.workflow.count(
+                'cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked'
+            ),
+            2,
+        )
         self.assertEqual(self.workflow.count('$signature = "$portable.sig"'), 2)
         self.assertIn("TAURI_CLI_VERSION: \"2.11.4\"", self.workflow)
         self.assertIn("ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}", self.workflow)
