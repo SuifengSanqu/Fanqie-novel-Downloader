@@ -1007,8 +1007,8 @@ jobs:
             if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -or [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
               throw '缺少便携版 updater 签名密钥'
             }
-            cargo install tauri-cli --version $env:TAURI_CLI_VERSION --locked
-            cargo tauri signer sign $portable
+            npm install --global "@tauri-apps/cli@$env:TAURI_CLI_VERSION"
+            tauri signer sign $portable
             $signature = "$portable.sig"
             if (-not (Test-Path -LiteralPath $signature -PathType Leaf) -or (Get-Item -LiteralPath $signature).Length -le 0) {
               throw "便携版签名生成失败: $signature"
@@ -1447,8 +1447,8 @@ jobs:
             if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -or [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
               throw '缺少便携版 updater 签名密钥'
             }
-            cargo install tauri-cli --version $env:TAURI_CLI_VERSION --locked
-            cargo tauri signer sign $portable
+            npm install --global "@tauri-apps/cli@$env:TAURI_CLI_VERSION"
+            tauri signer sign $portable
             $signature = "$portable.sig"
             if (-not (Test-Path -LiteralPath $signature -PathType Leaf) -or (Get-Item -LiteralPath $signature).Length -le 0) {
               throw "便携版签名生成失败: $signature"
@@ -1643,7 +1643,7 @@ jobs:
             "platforms;android-${ANDROID_API_LEVEL}" \
             "build-tools;${ANDROID_BUILD_TOOLS}" \
             "ndk;${ANDROID_NDK_VERSION}"
-          cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
+          npm install --global "@tauri-apps/cli@${TAURI_CLI_VERSION}"
 
       - name: Configure Android version
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
@@ -1697,7 +1697,7 @@ jobs:
           rm -rf src-tauri/gen/android/app/build/outputs/apk \
             src-tauri/gen/android/app/build/outputs/bundle
           echo "::group::Building all Android artifacts"
-          cargo tauri android build \
+          tauri android build \
             --target aarch64 armv7 i686 x86_64 \
             --apk \
             --aab \
@@ -1804,7 +1804,7 @@ jobs:
           if ! command -v xcodegen >/dev/null 2>&1; then
             brew install xcodegen
           fi
-          cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
+          npm install --global "@tauri-apps/cli@${TAURI_CLI_VERSION}"
 
       - name: Configure and validate iOS project
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
@@ -1836,7 +1836,7 @@ jobs:
         env:
           FANQIE_UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
         run: >-
-          cargo tauri ios build
+          tauri ios build
           --target aarch64
           --ci
           --no-sign
@@ -1852,7 +1852,7 @@ jobs:
           IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
           APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
         run: >-
-          cargo tauri ios build
+          tauri ios build
           --target aarch64
           --ci
           --export-method app-store-connect

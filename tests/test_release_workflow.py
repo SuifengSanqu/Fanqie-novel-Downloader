@@ -147,14 +147,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
         )
         self.assertEqual(
             self.workflow.count(
-                "cargo install tauri-cli --version $env:TAURI_CLI_VERSION --locked"
+                'npm install --global "@tauri-apps/cli@$env:TAURI_CLI_VERSION"'
             ),
             2,
         )
         self.assertEqual(
-            self.workflow.count("cargo tauri signer sign $portable"),
+            self.workflow.count("tauri signer sign $portable"),
             2,
         )
+        self.assertNotIn("cargo install tauri-cli", self.workflow)
         self.assertEqual(self.workflow.count('$signature = "$portable.sig"'), 2)
         self.assertIn("TAURI_CLI_VERSION: \"2.11.4\"", self.workflow)
         self.assertIn("ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}", self.workflow)
