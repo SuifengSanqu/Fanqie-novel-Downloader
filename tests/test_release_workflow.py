@@ -10,9 +10,6 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "build-release.yml"
-UNSIGNED_MACOS_WORKFLOW = (
-    ROOT / ".github" / "workflows" / "publish-unsigned-macos.yml"
-)
 MAINTENANCE_WORKFLOW = (
     ROOT / ".github" / "workflows" / "release-maintenance.yml"
 )
@@ -28,9 +25,6 @@ class ReleaseWorkflowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
-        cls.unsigned_macos_workflow = UNSIGNED_MACOS_WORKFLOW.read_text(
-            encoding="utf-8"
-        )
         cls.maintenance_workflow = MAINTENANCE_WORKFLOW.read_text(
             encoding="utf-8"
         )
@@ -180,7 +174,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             2,
         )
         self.assertEqual(
-            self.workflow.count(
+            self.main_release_section().count(
                 'codesign -dvv "${app_path}" 2>&1 | grep -Fqx "Signature=adhoc"'
             ),
             2,
@@ -196,7 +190,9 @@ class ReleaseWorkflowTest(unittest.TestCase):
             "inputs.publish_unsigned_release == true"
         )
         self.assertGreaterEqual(self.workflow.count(release_enabled), 2)
-        self.assertEqual(self.workflow.count("uploadWorkflowArtifacts: false"), 2)
+        self.assertEqual(
+            self.main_release_section().count("uploadWorkflowArtifacts: false"), 2
+        )
         self.assertNotIn("uploadWorkflowArtifacts: true", self.workflow)
         self.assertEqual(
             self.workflow.count(
@@ -369,68 +365,80 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.assertNotIn("APPLE_ID:", section)
         self.assertIn('>> "${GITHUB_ENV}"', self.workflow)
 
+    def macos_unsigned_section(self):
+        return self.workflow.split("  macos-unsigned-bootstrap:", 1)[1]
+
+    def main_release_section(self):
+        return self.workflow.split("  macos-unsigned-bootstrap:", 1)[0]
+
     def test_unsigned_macos_channel_never_enters_stable_updater_flow(self):
-        workflow = self.unsigned_macos_workflow
-        self.assertIn("name: 发布 / macOS 未签名", workflow)
-        self.assertIn('tag = f"macos-unsigned-v{version}', workflow)
-        self.assertIn("--draft=false", workflow)
-        self.assertGreaterEqual(workflow.count("--prerelease"), 2)
-        self.assertIn("uploadUpdaterJson: false", workflow)
-        self.assertIn("uploadUpdaterSignatures: false", workflow)
-        self.assertIn('"createUpdaterArtifacts": False', workflow)
-        self.assertIn("### 其他平台状态", workflow)
-        self.assertIn("\\`apksigner\\`", workflow)
-        self.assertNotIn("scripts/finalize-release.py", workflow)
-        self.assertNotIn("--latest", workflow)
-        self.assertIn("releases/tags/stable", workflow)
+        self.assertIn("macos_unsigned_channel:", self.workflow)
+        self.assertIn('tag_name = f"macos-unsigned-v{version}', self.workflow)
+        # 独立通道与签名 / unsigned-v* 流程互斥：release-bootstrap 被跳过后
+        # desktop / android / ios / finalize 全部不会运行。
+        self.assertIn("if: inputs.macos_unsigned_channel != true", self.workflow)
+        section = self.macos_unsigned_section()
+        self.assertIn("--draft=false", section)
+        self.assertGreaterEqual(section.count("--prerelease"), 2)
+        self.assertIn("uploadUpdaterJson: false", section)
+        self.assertIn("uploadUpdaterSignatures: false", section)
+        self.assertIn('"createUpdaterArtifacts": False', section)
+        self.assertIn("### 其他平台状态", section)
+        self.assertIn("\\`apksigner\\`", section)
+        self.assertNotIn("scripts/finalize-release.py", section)
+        self.assertNotIn("--latest", section)
+        self.assertIn("releases/tags/stable", section)
+        # 该通道不需要 updater 签名密钥
+        self.assertNotIn("TAURI_SIGNING_PRIVATE_KEY", section)
 
     def test_unsigned_macos_channel_builds_and_verifies_both_architectures(self):
-        workflow = self.unsigned_macos_workflow
+        # 两种架构由 prepare 的固定矩阵驱动，不受 platforms 输入影响。
         for value in (
-            "macos-15-intel",
-            "macos-latest",
-            "x86_64-apple-darwin",
-            "aarch64-apple-darwin",
+            '"os": "macos-15-intel",',
+            '"macho_arch": "x86_64",',
+            '"target": "x86_64-apple-darwin",',
+            '"os": "macos-latest",',
+            '"macho_arch": "arm64",',
+            '"target": "aarch64-apple-darwin",',
+        ):
+            self.assertIn(value, self.workflow)
+        section = self.macos_unsigned_section()
+        for value in (
+            "fromJSON(needs.prepare.outputs.macos_unsigned_matrix)",
             'test -d "${app_path}/Contents/_CodeSignature"',
             'codesign -dvv "${app_path}" 2>&1 | grep -Fqx "Signature=adhoc"',
             'test "${bundle_id}" = "com.pofl.fanqienoveldownloader"',
             'test "${bundle_version}" = "${APP_VERSION}"',
             'file "${executable}" | grep -F "${MACHO_ARCH}"',
             'hdiutil verify "${dmg_path}"',
-            'hdiutil attach -readonly -nobrowse -mountpoint',
+            "hdiutil attach -readonly -nobrowse -mountpoint",
             'ditto "${mounted_app}" "${runtime_app}"',
             '"${runtime_executable}" >"${runtime_log}" 2>&1 &',
             'kill -0 "${runtime_pid}"',
             "for _ in {1..15}",
         ):
-            self.assertIn(value, workflow)
+            self.assertIn(value, section)
 
         for arch in ("arm64", "x64"):
             for suffix in ("unsigned.dmg", "unsigned.zip"):
                 self.assertIn(
-                    f"FanqieNovelDownloader-macos-{arch}-{suffix}", workflow
+                    f"FanqieNovelDownloader-macos-{arch}-{suffix}", section
                 )
-        self.assertIn("SHA256SUMS-macos-unsigned.txt", workflow)
-        self.assertIn("sha256sum --check", workflow)
+        self.assertIn("SHA256SUMS-macos-unsigned.txt", section)
+        self.assertIn("sha256sum --check", section)
 
     def test_unsigned_macos_channel_keeps_private_source_out_of_artifacts(self):
-        workflow = self.unsigned_macos_workflow
-        private_checkouts = workflow.count(
-            "repository: ${{ env.PRIVATE_SOURCE_REPOSITORY }}"
-        )
-        self.assertEqual(private_checkouts, 3)
+        section = self.macos_unsigned_section()
         self.assertEqual(
-            workflow.count("token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}"),
-            private_checkouts,
+            section.count("repository: ${{ env.PRIVATE_SOURCE_REPOSITORY }}"), 1
         )
-        self.assertGreaterEqual(
-            workflow.count("persist-credentials: false"), private_checkouts
+        self.assertEqual(
+            section.count("token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}"), 1
         )
-        self.assertNotIn("actions/cache", workflow)
-        self.assertNotIn("Swatinem/rust-cache", workflow)
-        upload_section = workflow.split(
+        self.assertEqual(section.count("persist-credentials: false"), 1)
+        upload_section = section.split(
             "- name: Upload unsigned macOS bundles", 1
-        )[1].split("\n\n  publish:", 1)[0]
+        )[1].split("\n\n  macos-unsigned-publish:", 1)[0]
         self.assertIn("${{ runner.temp }}/unsigned-macos-", upload_section)
         self.assertNotIn("PRIVATE_SOURCE_PATH", upload_section)
         self.assertIn("retention-days: 7", upload_section)
@@ -439,7 +447,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         private_checkouts = self.workflow.count(
             "token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}"
         )
-        self.assertEqual(private_checkouts, 6)
+        self.assertEqual(private_checkouts, 7)
         self.assertEqual(
             self.workflow.count("persist-credentials: false"),
             private_checkouts,
@@ -450,9 +458,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn("actions/cache", self.workflow)
 
     def test_main_release_workflow_does_not_upload_workflow_artifacts(self):
-        self.assertNotIn("actions/upload-artifact", self.workflow)
-        self.assertNotIn("retention-days:", self.workflow)
-        self.assertEqual(self.workflow.count("uploadWorkflowArtifacts: false"), 2)
+        # 唯一允许的 workflow artifact 是 macOS 未签名通道 build → publish 的交接，
+        # 它只包含 runner.temp 里的成品包（见 keeps_private_source_out_of_artifacts）。
+        self.assertEqual(self.workflow.count("actions/upload-artifact"), 1)
+        self.assertEqual(self.workflow.count("retention-days:"), 1)
+        self.assertEqual(self.workflow.count("uploadWorkflowArtifacts: false"), 3)
 
     def test_finalization_normalizes_and_rechecks_updater_metadata(self):
         self.assertIn("scripts/finalize-release.py", self.workflow)
@@ -591,7 +601,6 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 "build-release.yml",
                 "ci.yml",
                 "issue-star-gate.yml",
-                "publish-unsigned-macos.yml",
                 "release-maintenance.yml",
             },
         )
