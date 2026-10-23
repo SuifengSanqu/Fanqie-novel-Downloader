@@ -450,13 +450,20 @@ jobs:
           fi
 
   verify:
+    # 静默 verify：私有源码的 fmt / clippy / test / node 检查仍在公开 runner 上跑
+    # （不占私有仓库的 Actions 额度），但所有输出（含依赖编译、apt 安装）只写进
+    # runner 本地临时文件，不打印、不上传。日志里只有每项通过/失败、退出码、用时；
+    # 失败时到私有仓库本地运行 scripts/verify-local.sh <检查名> 看完整输出。
+    # finalize / finalize-unsigned-release / desktop-fallback 仍要求本 job 成功。
     needs: prepare
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - name: Checkout release wrapper
         uses: actions/checkout@v4
         with:
           path: release-wrapper
+          persist-credentials: false
 
       - name: Test release metadata tooling
         working-directory: release-wrapper
@@ -476,25 +483,30 @@ jobs:
         with:
           components: rustfmt,clippy
 
-      - name: Install Tauri Linux dependencies
+      - name: Install Tauri Linux dependencies (silent)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            xdg-utils
+          set -uo pipefail
+          log="$(mktemp "${RUNNER_TEMP}/apt.XXXXXX")"
+          start=${SECONDS}
+          if { sudo apt-get update && sudo apt-get install -y \
+                libwebkit2gtk-4.1-dev \
+                libappindicator3-dev \
+                librsvg2-dev \
+                patchelf \
+                xdg-utils; } </dev/null >"${log}" 2>&1; then
+            echo "通过  apt-install     用时 $((SECONDS - start))s"
+            rm -f "${log}"
+          else
+            code=$?
+            rm -f "${log}"
+            echo "::error::Linux 依赖安装失败（退出码 ${code}），输出未打印。"
+            exit 1
+          fi
 
-      - name: Test and lint Tauri source
-        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
-        run: |
-          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-          cargo test --manifest-path src-tauri/Cargo.toml --all-features
-          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
-          node --test tests/*.js
-          node --check web/static/app.js
-          git diff --check
+      - name: Test and lint Tauri source (silent)
+        shell: bash
+        run: bash release-wrapper/scripts/silent-verify.sh "${PRIVATE_SOURCE_PATH}"
 
   release-bootstrap:
     needs: prepare
@@ -616,7 +628,7 @@ jobs:
           lines = [
               f"## {version}{release_label}",
               "",
-              "基于 **Rust + Tauri v2** 的番茄小说下载器。",
+              "番茄小说下载器：小说、漫画、短剧的下载与阅读工具。",
               "",
           ]
           if unsigned:
@@ -902,13 +914,22 @@ jobs:
             --github-output "${GITHUB_OUTPUT}"
 
   desktop:
-    needs: [prepare, verify, release-bootstrap]
+    # 不等 verify：构建只往 release-bootstrap 预建的 Draft 上传，Draft 不公开；
+    # finalize / finalize-unsigned-release 都要求 needs.verify.result == 'success'
+    # 才会发布，verify 失败时 Draft 留着，下次运行 prepare 会清掉。
+    needs: [prepare, release-bootstrap]
     if: needs.prepare.outputs.desktop_count != '0'
     strategy:
       fail-fast: false
-      # Signed releases merge latest.json; serial execution also prevents
-      # release-asset races in the unsigned prerelease path.
-      max-parallel: 1
+      # 桌面各平台并行构建。并行上传是安全的：
+      # - 所有附件都按 release-bootstrap 预建 Draft 的 ID 上传（338933b），
+      #   不会再按 tag 查找、另建第二个同 tag 草稿；
+      # - 各平台附件名互不相同（含 platform/arch），不会互相覆盖；
+      # - 唯一共享的是 tauri-action 读改写的 latest.json：并发时可能丢掉别的
+      #   平台条目或撞 404/422，tauri-action 会整体重试（retryAttempts），
+      #   而 finalize / finalize-unsigned-release 里的
+      #   normalize-updater-metadata.py 会按 Release 实际附件和 .sig 重建
+      #   全部 platforms，所以最终发布的 latest.json 与串行时一致。
       matrix: ${{ fromJSON(needs.prepare.outputs.desktop_matrix) }}
     runs-on: ${{ matrix.os }}
     # Scarce ARM/Intel runners may fail; continue so desktop-fallback can cross-build.
@@ -916,6 +937,16 @@ jobs:
     timeout-minutes: 90
     name: Desktop ${{ matrix.platform }}
     steps:
+      - name: Quiet cargo / rustc output in public logs
+        # 公开日志不打印 rustc warning（会带源码片段）和 Compiling/Downloaded
+        # 依赖清单。RUSTFLAGS 是在已有值后追加，不覆盖；编译错误仍会打印。
+        shell: bash
+        run: |
+          {
+            echo "RUSTFLAGS=${RUSTFLAGS:+${RUSTFLAGS} }-Awarnings"
+            echo "CARGO_TERM_QUIET=true"
+          } >> "${GITHUB_ENV}"
+
       - name: Checkout private Tauri source
         uses: actions/checkout@v4
         with:
@@ -1069,6 +1100,9 @@ jobs:
           FANQIE_UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
         with:
           projectPath: ${{ env.PRIVATE_SOURCE_PATH }}
+          # 构建输出（编译错误、链接命令、打包日志）只写 runner 本地临时文件，公开日志
+          # 只有通过/失败、退出码、用时；失败时提示去私有仓库本地复现。
+          tauriScript: node ${{ github.workspace }}/release-wrapper/scripts/silent-run.mjs --tauri
           args: >-
             --target ${{ matrix.target }}
             --bundles ${{ matrix.bundles }}
@@ -1078,6 +1112,9 @@ jobs:
           uploadWorkflowArtifacts: false
           uploadUpdaterJson: ${{ needs.prepare.outputs.create_updater_artifacts == 'true' }}
           uploadUpdaterSignatures: ${{ needs.prepare.outputs.create_updater_artifacts == 'true' }}
+          # 并行构建时多个 job 会同时读改写 latest.json，失败时多重试几次
+          # （每次随机等 1–10 秒后整体重读重写）。
+          retryAttempts: 5
           workflowArtifactNamePattern: FanqieNovelDownloader-tauri-[platform]-[arch]-[bundle]
           releaseAssetNamePattern: FanqieNovelDownloader-tauri-[platform]-[arch][setup][ext]
           # User installers may have no OS/vendor signature, but updater assets
@@ -1350,12 +1387,23 @@ jobs:
       needs.desktop.result != 'cancelled'
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # 与 desktop 相同：按 Draft ID 上传、附件名按平台区分，latest.json 由
+      # finalize 统一重建，可以并行。
       matrix: ${{ fromJSON(needs.prepare.outputs.desktop_fallback_matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     name: Desktop fallback ${{ matrix.platform }} (cross on ${{ matrix.os }})
     steps:
+      - name: Quiet cargo / rustc output in public logs
+        # 公开日志不打印 rustc warning（会带源码片段）和 Compiling/Downloaded
+        # 依赖清单。RUSTFLAGS 是在已有值后追加，不覆盖；编译错误仍会打印。
+        shell: bash
+        run: |
+          {
+            echo "RUSTFLAGS=${RUSTFLAGS:+${RUSTFLAGS} }-Awarnings"
+            echo "CARGO_TERM_QUIET=true"
+          } >> "${GITHUB_ENV}"
+
       - name: Checkout release wrapper
         uses: actions/checkout@v4
         with:
@@ -1486,25 +1534,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Linux host deps and ARM64 cross linker
+      - name: Install ARM64 cross-compile environment (multiarch)
         if: steps.need.outputs.run == 'true' && runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            xdg-utils \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu
-          {
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
-            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
-            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
-            # WebKit pkg-config is host-only; deb packaging still needs host tools.
-            echo "PKG_CONFIG_ALLOW_CROSS=1"
-          } >> "${GITHUB_ENV}"
+        # 以前只装了 x64 的 WebKitGTK，pkg-config 给出的是 x64 库，arm64 链接找不到
+        # glib 等库。脚本改用 multiarch 装 arm64 开发包，并只对 aarch64 目标设 pkg-config。
+        run: bash release-wrapper/scripts/setup-linux-arm64-cross.sh
 
       - name: Create release build config
         if: steps.need.outputs.run == 'true'
@@ -1596,6 +1630,9 @@ jobs:
           FANQIE_UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
         with:
           projectPath: ${{ env.PRIVATE_SOURCE_PATH }}
+          # 构建输出（编译错误、链接命令、打包日志）只写 runner 本地临时文件，公开日志
+          # 只有通过/失败、退出码、用时；失败时提示去私有仓库本地复现。
+          tauriScript: node ${{ github.workspace }}/release-wrapper/scripts/silent-run.mjs --tauri
           args: >-
             --target ${{ matrix.target }}
             --bundles ${{ matrix.bundles }}
@@ -1605,6 +1642,7 @@ jobs:
           uploadWorkflowArtifacts: false
           uploadUpdaterJson: ${{ needs.prepare.outputs.create_updater_artifacts == 'true' }}
           uploadUpdaterSignatures: ${{ needs.prepare.outputs.create_updater_artifacts == 'true' }}
+          retryAttempts: 5
           workflowArtifactNamePattern: FanqieNovelDownloader-tauri-[platform]-[arch]-fallback-[bundle]
           releaseAssetNamePattern: FanqieNovelDownloader-tauri-[platform]-[arch][setup][ext]
           # User installers may have no OS/vendor signature, but updater assets
@@ -1865,10 +1903,21 @@ jobs:
           spctl --assess --type execute --verbose=2 "${app_path}"
 
   android:
-    needs: [prepare, verify, release-bootstrap]
+    # 不等 verify：构建只往 release-bootstrap 预建的 Draft 上传，Draft 不公开；
+    # finalize / finalize-unsigned-release 都要求 needs.verify.result == 'success'
+    # 才会发布，verify 失败时 Draft 留着，下次运行 prepare 会清掉。
+    needs: [prepare, release-bootstrap]
     if: needs.prepare.outputs.android_enabled == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Quiet cargo output in public logs
+        # 公开日志不打印 Compiling/Downloaded 依赖清单。这里故意不设 RUSTFLAGS：
+        # cargo-mobile2 会在生成的 .cargo/config.toml 里写 target.<triple>.rustflags
+        # （Android 的 -landroid/-llog/-lOpenSLES 链接参数），RUSTFLAGS 环境变量会
+        # 整个顶掉它们导致链接失败。编译错误和 warning 仍会打印。
+        shell: bash
+        run: echo "CARGO_TERM_QUIET=true" >> "${GITHUB_ENV}"
+
       - name: Checkout private Tauri source
         uses: actions/checkout@v4
         with:
@@ -1927,7 +1976,8 @@ jobs:
             "platforms;android-${ANDROID_API_LEVEL}" \
             "build-tools;${ANDROID_BUILD_TOOLS}" \
             "ndk;${ANDROID_NDK_VERSION}"
-          cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
+          # 预编译 cargo-tauri（sha256 固定）；拿不到或校验不过时脚本自动退回 cargo install。
+          bash "${GITHUB_WORKSPACE}/release-wrapper/scripts/install-cargo-tauri.sh"
 
       - name: Configure Android version
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
@@ -1980,14 +2030,16 @@ jobs:
           # up a universal-only APK from an earlier build/cache.
           rm -rf src-tauri/gen/android/app/build/outputs/apk \
             src-tauri/gen/android/app/build/outputs/bundle
-          echo "::group::Building all Android artifacts"
-          cargo tauri android build \
+          # cargo / Gradle 的全部输出只写 runner 本地临时文件（编译错误会带私有源码，
+          # 链接失败会打出完整依赖清单）；公开日志只有通过/失败、退出码、用时。
+          node "${GITHUB_WORKSPACE}/release-wrapper/scripts/silent-run.mjs" \
+            --name android-build \
+            -- cargo tauri android build \
             --target aarch64 armv7 i686 x86_64 \
             --apk \
             --aab \
             --ci \
             --config src-tauri/tauri.android.release.conf.json
-          echo "::endgroup::"
           echo "=== Build outputs ==="
           find src-tauri/gen/android/app/build/outputs -type f \( -name '*.apk' -o -name '*.aab' \) -printf '%f  %s bytes\n' | sort
 
@@ -2039,12 +2091,23 @@ jobs:
             dist/android/*
 
   ios:
-    needs: [prepare, verify, release-bootstrap]
+    # 不等 verify：构建只往 release-bootstrap 预建的 Draft 上传，Draft 不公开；
+    # finalize / finalize-unsigned-release 都要求 needs.verify.result == 'success'
+    # 才会发布，verify 失败时 Draft 留着，下次运行 prepare 会清掉。
+    needs: [prepare, release-bootstrap]
     if: needs.prepare.outputs.ios_enabled == 'true'
     # macos-15 still ships Xcode 16.x; Xcode 26 breaks Tauri iOS via SwiftUICore.
     runs-on: macos-15
     continue-on-error: true
     steps:
+      - name: Quiet cargo output in public logs
+        # 公开日志不打印 Compiling/Downloaded 依赖清单。这里故意不设 RUSTFLAGS：
+        # cargo-mobile2 会在生成的 .cargo/config.toml 里写 target.<triple>.rustflags
+        # （Android 的 -landroid/-llog/-lOpenSLES 链接参数），RUSTFLAGS 环境变量会
+        # 整个顶掉它们导致链接失败。编译错误和 warning 仍会打印。
+        shell: bash
+        run: echo "CARGO_TERM_QUIET=true" >> "${GITHUB_ENV}"
+
       - name: Checkout private Tauri source
         uses: actions/checkout@v4
         with:
@@ -2116,7 +2179,8 @@ jobs:
           if ! command -v xcodegen >/dev/null 2>&1; then
             brew install xcodegen
           fi
-          cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
+          # 预编译 cargo-tauri（sha256 固定）；拿不到或校验不过时脚本自动退回 cargo install。
+          bash "${GITHUB_WORKSPACE}/release-wrapper/scripts/install-cargo-tauri.sh"
 
       - name: Configure and validate iOS project
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
@@ -2147,8 +2211,11 @@ jobs:
         working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
         env:
           FANQIE_UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
+        # cargo / Xcode 的全部输出只写 runner 本地临时文件；公开日志只有通过/失败。
         run: >-
-          cargo tauri ios build
+          node "${GITHUB_WORKSPACE}/release-wrapper/scripts/silent-run.mjs"
+          --name ios-build-unsigned
+          -- cargo tauri ios build
           --target aarch64
           --ci
           --no-sign
@@ -2163,8 +2230,11 @@ jobs:
           IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
           IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
           APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+        # cargo / Xcode 的全部输出只写 runner 本地临时文件；公开日志只有通过/失败。
         run: >-
-          cargo tauri ios build
+          node "${GITHUB_WORKSPACE}/release-wrapper/scripts/silent-run.mjs"
+          --name ios-build-app-store
+          -- cargo tauri ios build
           --target aarch64
           --ci
           --export-method app-store-connect
@@ -2547,6 +2617,16 @@ jobs:
     timeout-minutes: 90
     name: Build unsigned macOS ${{ matrix.arch }}
     steps:
+      - name: Quiet cargo / rustc output in public logs
+        # 公开日志不打印 rustc warning（会带源码片段）和 Compiling/Downloaded
+        # 依赖清单。RUSTFLAGS 是在已有值后追加，不覆盖；编译错误仍会打印。
+        shell: bash
+        run: |
+          {
+            echo "RUSTFLAGS=${RUSTFLAGS:+${RUSTFLAGS} }-Awarnings"
+            echo "CARGO_TERM_QUIET=true"
+          } >> "${GITHUB_ENV}"
+
       - name: Checkout private Tauri source
         uses: actions/checkout@v4
         with:
@@ -2556,6 +2636,13 @@ jobs:
           persist-credentials: false
           path: ${{ env.PRIVATE_SOURCE_PATH }}
           fetch-depth: 1
+
+      - name: Checkout release wrapper
+        uses: actions/checkout@v4
+        with:
+          path: release-wrapper
+          persist-credentials: false
+          sparse-checkout: scripts
 
       - name: Validate macOS app icon
         shell: bash
@@ -2602,6 +2689,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: ${{ env.PRIVATE_SOURCE_PATH }}
+          # 构建输出（编译错误、链接命令、打包日志）只写 runner 本地临时文件，公开日志
+          # 只有通过/失败、退出码、用时；失败时提示去私有仓库本地复现。
+          tauriScript: node ${{ github.workspace }}/release-wrapper/scripts/silent-run.mjs --tauri
           retryAttempts: 5
           args: >-
             --target ${{ matrix.target }}

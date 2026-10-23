@@ -153,13 +153,36 @@ class ReleaseWorkflowTest(unittest.TestCase):
         # 移动端不能改用 npm 的 tauri：Gradle 的 rustBuild* 任务和 Xcode 的
         # "Build Rust Code" script phase 调用的是 cargo 子命令 `cargo tauri`，
         # 而 npm 全局安装不会提供 ~/.cargo/bin/cargo-tauri，会报
-        # "no such command: tauri"。所以 Android / iOS 保留 cargo install。
+        # "no such command: tauri"。所以 Android / iOS 安装的是 tauri 官方
+        # Release 的预编译 cargo-tauri（sha256 固定），拿不到时退回 cargo install。
         self.assertEqual(
             self.workflow.count(
-                'cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked'
+                'bash "${GITHUB_WORKSPACE}/release-wrapper/scripts/install-cargo-tauri.sh"'
             ),
             2,
         )
+        self.assertNotIn("cargo install tauri-cli", self.workflow)
+        installer = (ROOT / "scripts" / "install-cargo-tauri.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked',
+            installer,
+        )
+        self.assertIn("shasum -a 256 -c -", installer)
+        self.assertIn('!= "tauri-cli ${version}"', installer)
+        cli_version = re.search(
+            r'TAURI_CLI_VERSION: "([0-9.]+)"', self.workflow
+        ).group(1)
+        # Android 跑在 ubuntu-latest（x86_64），iOS 跑在 macos-15（arm64）。
+        for asset in (
+            "cargo-tauri-x86_64-unknown-linux-gnu.tgz",
+            "cargo-tauri-aarch64-apple-darwin.zip",
+        ):
+            self.assertRegex(
+                installer,
+                re.escape(f"{cli_version}/{asset})") + r"\n\s+echo \"[0-9a-f]{64}\"",
+            )
         self.assertEqual(self.workflow.count('$signature = "$portable.sig"'), 2)
         self.assertIn("TAURI_CLI_VERSION: \"2.11.4\"", self.workflow)
         self.assertIn("ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}", self.workflow)
@@ -288,7 +311,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("def clean_draft_body", unsigned)
         self.assertIn("allow_legacy_draft", unsigned)
         self.assertIn("def append_finalizer", unsigned)
-        self.assertIn("## 无签名 Release Finalizer", unsigned)
+        self.assertIn("## 下载与安装", unsigned)
         self.assertIn("publish-unsigned-channel.py", unsigned)
         self.assertIn("prepare-release-artifacts.py", unsigned)
         self.assertIn("generate_finalizer_appendix", unsigned)
@@ -481,8 +504,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual(
             section.count("token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}"), 1
         )
-        # 私有源码检出一次，外加 bootstrap / publish 两次 wrapper 检出。
-        self.assertEqual(section.count("persist-credentials: false"), 3)
+        # 私有源码检出一次，外加 bootstrap / build（silent-run）/ publish 三次 wrapper 检出。
+        self.assertEqual(section.count("persist-credentials: false"), 4)
         upload_section = section.split(
             "- name: Upload unsigned macOS bundles", 1
         )[1].split("\n\n  macos-unsigned-publish:", 1)[0]
@@ -502,9 +525,134 @@ class ReleaseWorkflowTest(unittest.TestCase):
         private = [block for block in checkouts if "PRIVATE_SOURCE_TOKEN" in block]
         self.assertEqual(len(private), private_checkouts)
         upload_wrappers = [block for block in checkouts if "sparse-checkout: scripts" in block]
-        self.assertEqual(len(upload_wrappers), 5)
+        self.assertEqual(len(upload_wrappers), 6)
         for block in private + upload_wrappers:
             self.assertIn("persist-credentials: false", block)
+
+    def _job_blocks(self):
+        jobs_text = self.workflow.split("\njobs:\n", 1)[1]
+        parts = re.split(r"(?m)^  ([A-Za-z0-9_-]+):\n", jobs_text)
+        return dict(zip(parts[1::2], parts[2::2]))
+
+    def test_private_builds_run_through_silent_runner(self):
+        # 会编译私有源码的步骤（三处 tauri-action 和 Android / iOS 的 cargo tauri build）
+        # 必须经过 scripts/silent-run.mjs：编译错误、链接命令（完整依赖清单、私有 crate
+        # 名）和打包日志只写 runner 本地临时文件，不进公开日志。
+        silent = "node ${{ github.workspace }}/release-wrapper/scripts/silent-run.mjs --tauri"
+        steps = re.split(r"(?m)^      - ", self.workflow)
+        tauri_steps = [step for step in steps if "uses: tauri-apps/tauri-action" in step]
+        self.assertEqual(len(tauri_steps), 3)
+        for step in tauri_steps:
+            self.assertIn(f"tauriScript: {silent}", step)
+
+        raw_builds = re.findall(r"(?m)^.*cargo tauri (?:android|ios) build.*$", self.workflow)
+        self.assertEqual(len(raw_builds), 3)
+        for line in raw_builds:
+            self.assertRegex(line.strip(), r"^-- cargo tauri (android|ios) build")
+        self.assertEqual(
+            self.workflow.count('node "${GITHUB_WORKSPACE}/release-wrapper/scripts/silent-run.mjs"'),
+            3,
+        )
+        for name in ("--name android-build", "--name ios-build-unsigned", "--name ios-build-app-store"):
+            self.assertIn(name, self.workflow)
+
+        # 每个用到 silent-run.mjs 的 job 都要先 checkout 公开仓库的 scripts。
+        for job, block in self._job_blocks().items():
+            if "silent-run.mjs" not in block:
+                continue
+            checkout = block.find("path: release-wrapper")
+            self.assertNotEqual(checkout, -1, job)
+            self.assertLess(checkout, block.find("silent-run.mjs"), job)
+        self.assertTrue((ROOT / "scripts" / "silent-run.mjs").is_file())
+
+    def test_linux_arm64_fallback_uses_multiarch_cross_environment(self):
+        fallback = self._job_blocks()["desktop-fallback"]
+        self.assertIn("run: bash release-wrapper/scripts/setup-linux-arm64-cross.sh", fallback)
+        # 不再用宿主机 x64 的 WebKitGTK 开发包去链接 arm64 目标。
+        self.assertNotIn("libwebkit2gtk-4.1-dev", fallback)
+        script = (ROOT / "scripts" / "setup-linux-arm64-cross.sh").read_text(encoding="utf-8")
+        for needle in (
+            "dpkg --add-architecture arm64",
+            "ports.ubuntu.com/ubuntu-ports",
+            "libwebkit2gtk-4.1-dev:arm64",
+            "libdbus-1-dev:arm64",
+            "PKG_CONFIG_LIBDIR_${underscored}",
+            "CARGO_TARGET_${upper}_LINKER",
+        ):
+            self.assertIn(needle, script)
+        # 只输出环境变量和 apt 日志，不编译任何源码。
+        self.assertNotIn("cargo ", script)
+        self.assertNotIn("tauri ", script.replace("Tauri ", ""))
+
+    def test_desktop_builds_run_in_parallel_with_latest_json_retries(self):
+        # 桌面构建按 Draft ID 上传、附件名按平台区分，latest.json 由 finalize
+        # 按实际附件重建，所以不再需要 max-parallel: 1 串行。
+        self.assertNotIn("max-parallel", self.workflow)
+        desktop = self.workflow.split("\n  desktop:\n", 1)[1].split(
+            "\n  android:\n", 1
+        )[0]
+        self.assertEqual(desktop.count("uses: tauri-apps/tauri-action@v1"), 2)
+        self.assertEqual(desktop.count("retryAttempts: 5"), 2)
+        self.assertIn(
+            "metadata[\"platforms\"] = expected",
+            (ROOT / "scripts" / "normalize-updater-metadata.py").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    def test_builds_overlap_verify_but_publishing_still_requires_it(self):
+        # 桌面 / Android / iOS 和 verify 同时跑，只往不公开的 Draft 上传；
+        # 真正发布的两个 finalize 必须显式要求 verify 成功。
+        self.assertEqual(
+            self.workflow.count("    needs: [prepare, release-bootstrap]\n"), 3
+        )
+        for job in ("finalize", "finalize-unsigned-release"):
+            section = self.workflow.split(f"\n  {job}:\n", 1)[1].split(
+                "\n    steps:\n", 1
+            )[0]
+            self.assertIn("verify", section.split("\n", 1)[0])
+            self.assertIn("needs.verify.result == 'success' &&", section)
+        fallback = self.workflow.split("\n  desktop-fallback:\n", 1)[1].split(
+            "\n    strategy:\n", 1
+        )[0]
+        self.assertIn("needs.verify.result == 'success' &&", fallback)
+
+    def test_verify_keeps_private_output_out_of_public_logs(self):
+        # verify 仍在公开 runner 上跑，但所有私有检查的输出都只写 runner 本地
+        # 临时文件：workflow 里不能直接出现 cargo/node 检查命令，apt 输出也要重定向。
+        verify = self.workflow.split("\n  verify:\n", 1)[1].split(
+            "\n  release-bootstrap:\n", 1
+        )[0]
+        self.assertIn(
+            'bash release-wrapper/scripts/silent-verify.sh "${PRIVATE_SOURCE_PATH}"',
+            verify,
+        )
+        for raw in ("cargo test", "cargo clippy", "cargo fmt", "node --test", "git diff --check"):
+            self.assertNotIn(raw, verify)
+        self.assertIn('</dev/null >"${log}" 2>&1', verify)
+        self.assertNotIn("upload-artifact", verify)
+        self.assertNotIn("set -x", verify)
+
+    def test_public_builds_quiet_cargo_and_rustc_warnings(self):
+        def section(job, end):
+            return self.workflow.split(f"\n  {job}:\n", 1)[1].split(f"\n  {end}:\n", 1)[0]
+
+        append = 'echo "RUSTFLAGS=${RUSTFLAGS:+${RUSTFLAGS} }-Awarnings"'
+        for job, end in (
+            ("desktop", "desktop-fallback"),
+            ("desktop-fallback", "android"),
+            ("macos-unsigned-build", "macos-unsigned-publish"),
+        ):
+            body = section(job, end)
+            self.assertEqual(body.count(append), 1, job)
+            self.assertEqual(body.count('echo "CARGO_TERM_QUIET=true"'), 1, job)
+        # 移动端不能设 RUSTFLAGS：会顶掉 cargo-mobile2 写的 target rustflags。
+        for job, end in (("android", "ios"), ("ios", "finalize")):
+            body = section(job, end)
+            self.assertNotIn("RUSTFLAGS=", body, job)
+            self.assertIn('echo "CARGO_TERM_QUIET=true" >> "${GITHUB_ENV}"', body)
+        # 只追加，不在任何地方直接覆盖 RUSTFLAGS。
+        self.assertNotRegex(self.workflow, r"\n\s+RUSTFLAGS:")
 
     def test_private_source_builds_do_not_use_public_actions_cache(self):
         self.assertNotIn("Swatinem/rust-cache", self.workflow)
