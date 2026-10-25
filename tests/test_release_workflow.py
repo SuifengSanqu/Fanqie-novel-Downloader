@@ -186,7 +186,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 re.escape(f"{cli_version}/{asset})") + r"\n\s+echo \"[0-9a-f]{64}\"",
             )
         self.assertEqual(self.workflow.count('$signature = "$portable.sig"'), 2)
-        self.assertIn("TAURI_CLI_VERSION: \"2.11.4\"", self.workflow)
+        self.assertIn("TAURI_CLI_VERSION: \"2.12.4\"", self.workflow)
         self.assertIn("ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}", self.workflow)
         self.assertIn(
             "inputs.publish_unsigned_prerelease == true || "
@@ -388,6 +388,72 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.workflow.count("dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0"),
             5,
         )
+
+    def run_android_signer_check(self, mode, digests):
+        """运行 Android 收集步骤里的签名校验片段，apksigner 用假的替代。"""
+        import subprocess
+        import tempfile
+
+        android_job = self.workflow.split("\n  android:\n", 1)[1].split(
+            "\n  ios:\n", 1
+        )[0]
+        step = android_job.split("- name: Collect and verify signed Android artifacts\n", 1)[1]
+        step = step.split("\n      - name: ", 1)[0]
+        body = step.split('          APKSIGNER="', 1)[1]
+        body = '          APKSIGNER="' + body.split("} > dist/android/SIGNING.txt", 1)[0]
+        body += "} > dist/android/SIGNING.txt\n"
+        expected = re.search(
+            r'(?m)^  ANDROID_RELEASE_SIGNER_SHA256: "([0-9a-f]{64})"$', self.workflow
+        ).group(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = root / "sdk" / "build-tools" / "36.0.0"
+            tools.mkdir(parents=True)
+            fake = tools / "apksigner"
+            lines = "".join(
+                f"echo 'Signer #{i} certificate SHA-256 digest: {d}'\n"
+                for i, d in enumerate(digests, 1)
+            )
+            fake.write_text("#!/usr/bin/env bash\necho Verifies\n" + lines, encoding="utf-8")
+            fake.chmod(0o755)
+            (root / "dist" / "android").mkdir(parents=True)
+            (root / "dist" / "android" / "app-arm64-v8a.apk").write_bytes(b"apk")
+            env = dict(
+                os.environ,
+                ANDROID_HOME=str(root / "sdk"),
+                ANDROID_BUILD_TOOLS="36.0.0",
+                ANDROID_RELEASE_SIGNER_SHA256=expected,
+                FANQIE_ANDROID_SIGNING_MODE=mode,
+            )
+            result = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + textwrap.dedent(body)],
+                cwd=root, env=env, capture_output=True, text=True,
+            )
+            signing = root / "dist" / "android" / "SIGNING.txt"
+            text = signing.read_text(encoding="utf-8") if signing.exists() else ""
+            return result, expected, text
+
+    def test_android_release_apks_must_carry_the_pinned_signer(self):
+        result, expected, signing = self.run_android_signer_check("release-secret", [])
+        self.assertNotEqual(result.returncode, 0)
+        ok, expected, signing = self.run_android_signer_check(
+            "release-secret", [expected.upper()]
+        )
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn(f"signer_sha256={expected}", signing)
+        wrong, _, _ = self.run_android_signer_check("release-secret", ["ab" * 32])
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertIn("ANDROID_KEYSTORE_", wrong.stderr)
+        extra, _, _ = self.run_android_signer_check(
+            "release-secret", [expected, "cd" * 32]
+        )
+        self.assertNotEqual(extra.returncode, 0)
+
+    def test_ci_internal_android_signing_only_warns(self):
+        result, _, signing = self.run_android_signer_check("ci-internal", ["ab" * 32])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("::warning::", result.stdout)
+        self.assertNotIn("signer_sha256=", signing)
 
     def test_android_setup_does_not_request_the_retired_tools_package(self):
         android_job = self.workflow.split("\n  android:\n", 1)[1].split(
@@ -635,6 +701,89 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn("upload-artifact", verify)
         self.assertNotIn("set -x", verify)
 
+    def test_prepare_runs_silent_third_party_license_gate(self):
+        prepare = self.workflow.split("\n  prepare:\n", 1)[1].split("\n  verify:\n", 1)[0]
+        self.assertIn("- name: Generate third-party license list (silent)", prepare)
+        self.assertRegex(prepare, r'CARGO_ABOUT_SHA256: "[0-9a-f]{64}"')
+        self.assertIn('>"${work}/log" 2>&1 </dev/null', prepare)
+        self.assertIn(
+            "third_party_licenses: ${{ steps.licenses.outputs.available }}", prepare
+        )
+        upload = prepare.split("- name: Upload third-party license list", 1)[1].split(
+            "\n\n", 1
+        )[0]
+        # artifact 里只有生成的 HTML，不带私有源码。
+        self.assertIn(
+            "path: ${{ runner.temp }}/third-party-licenses/THIRD_PARTY_LICENSES.html",
+            upload,
+        )
+        self.assertNotIn("PRIVATE_SOURCE_PATH", upload)
+        self.assertIn("retention-days: 3", upload)
+
+    def test_installers_and_release_ship_third_party_license_list(self):
+        for job in ("desktop", "desktop-fallback", "android", "ios", "macos-unsigned-build"):
+            section = self.workflow.split(f"\n  {job}:\n", 1)[1]
+            section = re.split(r"\n  [a-z][a-z-]*:\n", section, maxsplit=1)[0]
+            with self.subTest(job=job):
+                self.assertIn("- name: Download third-party license list", section)
+                self.assertIn(
+                    "path: ${{ env.PRIVATE_SOURCE_PATH }}/src-tauri/licenses", section
+                )
+                self.assertIn("fanqie-third-party-licenses-placeholder", section)
+        bootstrap = self.workflow.split("\n  release-bootstrap:\n", 1)[1].split(
+            "\n  desktop:\n", 1
+        )[0]
+        self.assertIn(
+            '"${RUNNER_TEMP}/third-party-licenses/THIRD_PARTY_LICENSES.html"', bootstrap
+        )
+
+    def test_published_release_requires_updater_signing_key(self):
+        prepare = self.workflow.split("\n  prepare:\n", 1)[1].split("\n  verify:\n", 1)[0]
+        self.assertIn(
+            'if [[ "${PUBLISH_RELEASE}" == "true" && "${updater}" != "true" ]]; then',
+            prepare,
+        )
+
+    def test_published_android_release_requires_official_keystore_up_front(self):
+        self.assertIn(
+            "FANQIE_ANDROID_REQUIRE_RELEASE_SIGNING: ${{ inputs.publish_release == true && 'true' || 'false' }}",
+            self.workflow,
+        )
+        self.assertIn(
+            "if: inputs.publish_release == true && steps.signing.outputs.mode != 'release-secret'",
+            self.workflow,
+        )
+
+    def test_android_apks_get_16k_alignment_check_before_upload(self):
+        check = self.workflow.index("- name: Check Android 16 KiB page alignment")
+        collect = self.workflow.index("- name: Collect and verify signed Android artifacts")
+        upload = self.workflow.index("- name: Upload Android release assets")
+        self.assertLess(collect, check)
+        self.assertLess(check, upload)
+        self.assertIn("scripts/check-android-16k-alignment.py", self.workflow)
+
+    def test_release_runs_are_never_cancelled_mid_publish(self):
+        head = self.workflow.split("\njobs:\n", 1)[0]
+        self.assertIn("cancel-in-progress: false", head)
+        self.assertNotIn("cancel-in-progress: true", head)
+        merge = (ROOT / ".github" / "workflows" / "maintenance-merge-drafts.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("cancel-in-progress: false", merge)
+
+    def test_verify_summary_reaches_both_finalize_steps(self):
+        verify = self.workflow.split("\n  verify:\n", 1)[1].split(
+            "\n  release-bootstrap:\n", 1
+        )[0]
+        self.assertIn("summary: ${{ steps.silent_verify.outputs.summary }}", verify)
+        self.assertIn("id: silent_verify", verify)
+        self.assertEqual(
+            self.workflow.count(
+                "FANQIE_VERIFY_SUMMARY: ${{ needs.verify.outputs.summary }}"
+            ),
+            2,
+        )
+
     def test_public_builds_quiet_cargo_and_rustc_warnings(self):
         def section(job, end):
             return self.workflow.split(f"\n  {job}:\n", 1)[1].split(f"\n  {end}:\n", 1)[0]
@@ -656,15 +805,42 @@ class ReleaseWorkflowTest(unittest.TestCase):
         # 只追加，不在任何地方直接覆盖 RUSTFLAGS。
         self.assertNotRegex(self.workflow, r"\n\s+RUSTFLAGS:")
 
-    def test_private_source_builds_do_not_use_public_actions_cache(self):
-        self.assertNotIn("Swatinem/rust-cache", self.workflow)
+    def test_rust_cache_never_stores_private_build_outputs(self):
+        # fork PR 的 workflow 能读 main 的缓存，所以缓存只放公开依赖的编译产物。
         self.assertNotIn("actions/cache", self.workflow)
+        self.assertEqual(
+            self.workflow.count(
+                "uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3"
+            ),
+            3,
+        )
+        self.assertEqual(self.workflow.count('cache-workspace-crates: "false"'), 3)
+        self.assertEqual(
+            self.workflow.count("save-if: ${{ github.ref == 'refs/heads/main' }}"), 3
+        )
+        self.assertNotIn("cache-on-failure", self.workflow)
+        for job, nxt in (
+            ("desktop", "desktop-fallback"),
+            ("android", "ios"),
+            ("ios", "finalize"),
+        ):
+            section = self.workflow.split(f"\n  {job}:\n", 1)[1].split(f"\n  {nxt}:\n", 1)[0]
+            with self.subTest(job=job):
+                self.assertIn("Swatinem/rust-cache@", section)
+                last_step = section.rsplit("\n      - ", 1)[1]
+                self.assertTrue(
+                    last_step.startswith("name: Remove private build outputs before cache save")
+                )
+                self.assertIn("if: always()", last_step)
+                self.assertIn("-name '*fanqie*'", last_step)
+                self.assertIn('rm -rf "${target}"', last_step)
 
     def test_main_release_workflow_does_not_upload_workflow_artifacts(self):
-        # 唯一允许的 workflow artifact 是 macOS 未签名通道 build → publish 的交接，
-        # 它只包含 runner.temp 里的成品包（见 keeps_private_source_out_of_artifacts）。
-        self.assertEqual(self.workflow.count("actions/upload-artifact"), 1)
-        self.assertEqual(self.workflow.count("retention-days:"), 1)
+        # 只允许两个 workflow artifact：macOS 未签名通道 build → publish 的交接
+        # （只含 runner.temp 里的成品包，见 keeps_private_source_out_of_artifacts），
+        # 以及 prepare 生成的第三方许可证清单（见 prepare_runs_silent_third_party_license_gate）。
+        self.assertEqual(self.workflow.count("actions/upload-artifact"), 2)
+        self.assertEqual(self.workflow.count("retention-days:"), 2)
         self.assertEqual(self.workflow.count("uploadWorkflowArtifacts: false"), 3)
 
     def test_finalization_normalizes_and_rechecks_updater_metadata(self):
