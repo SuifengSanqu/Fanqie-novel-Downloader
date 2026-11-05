@@ -982,6 +982,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             {
                 "build-release.yml",
                 "ci.yml",
+                "issue-auto-close.yml",
                 "issue-log-check.yml",
                 "maintenance-merge-drafts.yml",
                 "release-maintenance.yml",
